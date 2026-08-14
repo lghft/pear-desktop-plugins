@@ -6,6 +6,7 @@
   padding: 4px 6px;
   opacity: 0.75;
   transition: opacity 0.15s ease;
+  color: #ffffff !important; /* Added this line */
 }
 
 .ai-blocker-btn:hover {

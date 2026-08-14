@@ -159,7 +159,7 @@ async function forceMenuRefresh() {
       if (item.submenu && item.submenu.items) {
         if (item.label === 'Plugins' || item.role === 'plugins') {
           clone.submenu = item.submenu.items.map((pluginItem: any) => {
-            const isOurs = pluginItem.label === 'AI Artist & Song Blocker (Zoundhub)' || pluginItem.label === 'AI Artist & Song Blocker';
+            const isOurs = pluginItem.label === 'AI Artist Blocker' || pluginItem.label === 'AI Artist & Song Blocker';
             if (isOurs) {
               const newSubmenu = [...currentPluginMenu];
               const pearEnabled = pluginItem.submenu?.items?.find((i: any) => i.label === 'Enabled' && (i.type === 'checkbox' || i.type === 'normal'));
@@ -190,11 +190,6 @@ async function forceMenuRefresh() {
     const newTemplate = appMenu.items.map(cloneMenuItem);
     Menu.setApplicationMenu(Menu.buildFromTemplate(newTemplate));
 
-    // Menu.setApplicationMenu() only updates Electron's internal menu object.
-    // Pear Desktop's in-app-menu plugin renders its own HTML title bar and
-    // only repaints when it receives this signal (the same one Pear's own
-    // refreshMenu() in src/menu.ts sends) — without it, the title bar keeps
-    // showing whatever it last rendered until the window reloads/restarts.
     if (mainWindow && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.send('refresh-in-app-menu');
     }
@@ -270,7 +265,6 @@ async function buildPluginMenu(): Promise<Electron.MenuItemConstructorOptions[]>
     {
       label: '➕ Add keyword',
       click: () => {
-        // Run asynchronously outside the synchronous menu handler return stack
         setImmediate(async () => {
           const newKeyword = await promptKeywordFromRenderer(mainWindow);
           if (newKeyword) {
@@ -426,24 +420,51 @@ let rendererConfig: PluginConfig = { ...DEFAULT_CONFIG };
 let rendererZoundhubSet = new Set<string>();
 let playerApi: any = null;
 
-function isBlocked(title: string, artist: string): boolean {
-  if (!rendererConfig || rendererConfig.enabled === false) return false;
+function extractArtistCandidates(rawArtist: string): string[] {
+  if (!rawArtist) return [];
+
+  const firstSegment = rawArtist.split('•')[0];
+  const stripped = firstSegment.replace(/-\s*topic\s*$/i, '');
+
+  const parts = stripped
+    .split(/,|&|\bfeat\.?\b|\bfeaturing\b|\bwith\b|\bx\b/gi)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const candidates = new Set<string>([stripped.trim(), ...parts]);
+  return Array.from(candidates).filter(Boolean).map(normalize);
+}
+
+type BlockReason = 'artist' | 'song' | 'keyword' | 'zoundhub';
+
+function getBlockReason(title: string, artist: string): BlockReason | null {
+  if (!rendererConfig || rendererConfig.enabled === false) return null;
 
   const nTitle = normalize(title || '');
   const nArtist = normalize(artist || '');
+  const artistCandidates = extractArtistCandidates(artist || '');
 
   const artists = Array.isArray(rendererConfig.blockedArtists) ? rendererConfig.blockedArtists : [];
-  if (artists.some((a) => normalize(a) === nArtist)) return true;
+  if (artists.some((a) => normalize(a) === nArtist)) return 'artist';
 
   const songs = Array.isArray(rendererConfig.blockedSongs) ? rendererConfig.blockedSongs : [];
-  if (songs.some((s) => normalize(s.title) === nTitle && normalize(s.artist) === nArtist)) return true;
+  if (songs.some((s) => normalize(s.title) === nTitle && normalize(s.artist) === nArtist)) return 'song';
 
   const keywords = Array.isArray(rendererConfig.blockedKeywords) ? rendererConfig.blockedKeywords : [];
-  if (keywords.some((k) => k && nTitle.includes(normalize(k)))) return true;
+  if (keywords.some((k) => k && nTitle.includes(normalize(k)))) return 'keyword';
 
-  if (rendererConfig.syncZoundhub && rendererZoundhubSet.has(nArtist)) return true;
+  if (
+    rendererConfig.syncZoundhub &&
+    artistCandidates.some((candidate) => rendererZoundhubSet.has(candidate))
+  ) {
+    return 'zoundhub';
+  }
 
-  return false;
+  return null;
+}
+
+function isBlocked(title: string, artist: string): boolean {
+  return getBlockReason(title, artist) !== null;
 }
 
 export default createPlugin({
@@ -572,28 +593,62 @@ export default createPlugin({
       };
 
       let lastSkipKey = '';
+      let lastSkipAttemptAt = 0;
+      let skipAttemptCount = 0;
+      const SKIP_RETRY_MS = 1500;
+      const MAX_SKIP_ATTEMPTS = 8;
+
+      const attemptSkip = (info: { title: string; artist: string }, reason: string | null) => {
+        const nextBtn = document.querySelector<HTMLElement>(
+          '#next-button, .next-button.ytmusic-player-bar, tp-yt-paper-icon-button.next-button',
+        );
+        if (nextBtn) {
+          nextBtn.click();
+        } else {
+          playerApi?.nextVideo?.();
+        }
+        console.log(
+          `[ai-blocker] skip attempt #${skipAttemptCount} for blocked track (reason: ${reason}): ${info.artist} — ${info.title}`,
+        );
+      };
+
+      const GIVE_UP_COOLDOWN_MS = 15000;
+
       const trySkipIfBlocked = () => {
         const info = getCurrentTrackInfo();
         if (!info) return;
 
         const key = `${info.title}|||${info.artist}`;
+        const reason = getBlockReason(info.title, info.artist);
 
-        if (isBlocked(info.title, info.artist)) {
+        if (reason !== null) {
+          const now = Date.now();
+
           if (key !== lastSkipKey) {
-            console.log(`[ai-blocker] skipping blocked track: ${info.artist} — ${info.title}`);
             lastSkipKey = key;
-
-            const nextBtn = document.querySelector<HTMLElement>(
-              '#next-button, .next-button.ytmusic-player-bar, tp-yt-paper-icon-button.next-button',
+            skipAttemptCount = 1;
+            lastSkipAttemptAt = now;
+            attemptSkip(info, reason);
+          } else if (skipAttemptCount < MAX_SKIP_ATTEMPTS && now - lastSkipAttemptAt >= SKIP_RETRY_MS) {
+            skipAttemptCount++;
+            lastSkipAttemptAt = now;
+            attemptSkip(info, reason);
+          } else if (
+            skipAttemptCount >= MAX_SKIP_ATTEMPTS &&
+            now - lastSkipAttemptAt >= GIVE_UP_COOLDOWN_MS
+          ) {
+            skipAttemptCount = 1;
+            lastSkipAttemptAt = now;
+            attemptSkip(info, reason);
+          } else if (skipAttemptCount === MAX_SKIP_ATTEMPTS) {
+            skipAttemptCount++;
+            console.warn(
+              `[ai-blocker] gave up trying to skip "${info.title}" — ${info.artist} after ${MAX_SKIP_ATTEMPTS} attempts. Will try again in ${GIVE_UP_COOLDOWN_MS / 1000}s if it's still playing. The next/nextVideo controls may not be working — check selectors.`,
             );
-            if (nextBtn) {
-              nextBtn.click();
-            } else {
-              playerApi?.nextVideo?.();
-            }
           }
         } else {
           lastSkipKey = '';
+          skipAttemptCount = 0;
         }
       };
 

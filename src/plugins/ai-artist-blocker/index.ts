@@ -468,7 +468,7 @@ function isBlocked(title: string, artist: string): boolean {
 }
 
 export default createPlugin({
-  name: () => 'AI Artist & Song Blocker (Zoundhub)',
+  name: () => 'AI Artist Blocker',
   restartNeeded: false,
   config: DEFAULT_CONFIG,
   stylesheets: [style],
